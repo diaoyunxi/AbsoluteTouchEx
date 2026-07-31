@@ -1,0 +1,77 @@
+name: Build and Release
+
+# 在推送版本标签（v*）或手动触发时，自动编译 x86/x64 并发布打包资产。
+# 注意：fork 仓库默认可能禁用 Actions，请到仓库 Settings -> Actions 中
+# 启用 "Allow all actions and reusable workflows" 后再推送标签触发。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [Win32, x64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build atdll (${{ matrix.platform }})
+        run: msbuild atdll\atdll.vcxproj /p:Configuration=Release /p:Platform=${{ matrix.platform }} /v:minimal
+
+      - name: Build atloader (${{ matrix.platform }})
+        run: msbuild atloader\atloader.vcxproj /p:Configuration=Release /p:Platform=${{ matrix.platform }} /v:minimal
+
+      - name: Build attest (${{ matrix.platform }})
+        run: msbuild attest\attest.vcxproj /p:Configuration=Release /p:Platform=${{ matrix.platform }} /v:minimal
+
+      - name: Collect binaries
+        shell: pwsh
+        run: |
+          $p = "${{ matrix.platform }}"
+          New-Item -ItemType Directory -Force -Path "out\$p" | Out-Null
+          Copy-Item "atdll\$p\Release\atdll.dll" "out\$p\"
+          Copy-Item "atloader\$p\Release\atloader.exe" "out\$p\"
+          Copy-Item "attest\$p\Release\attest.exe" "out\$p\"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.platform }}
+          path: out\${{ matrix.platform }}
+
+  release:
+    name: Package and Release
+    needs: build
+    runs-on: windows-2022
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path AbsoluteTouchEx\x86 | Out-Null
+          New-Item -ItemType Directory -Force -Path AbsoluteTouchEx\x64 | Out-Null
+          Copy-Item "artifacts\binaries-Win32\*" "AbsoluteTouchEx\x86\"
+          Copy-Item "artifacts\binaries-x64\*" "AbsoluteTouchEx\x64\"
+          Compress-Archive -Path AbsoluteTouchEx -DestinationPath AbsoluteTouchEx.zip
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: AbsoluteTouchEx.zip
+          generate_release_notes: true
