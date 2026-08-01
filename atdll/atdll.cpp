@@ -13,6 +13,11 @@
 //        投递绝对坐标鼠标移动；
 //     4. 热键（SHIFT+F6..F9）也注册到自有窗口，完全不触碰目标程序的 WndProc。
 //
+//   手势（v2.1.0 新增，触屏式映射）：
+//     落指 = 左键按下；跟手移动 = 拖动；抬起 = 弹起（轻触即单击，滑动即拖动）；
+//     落指后持续按下且未明显滑动超过 LONG_PRESS_MS = 右键；触控板边缘留一圈
+//     （最外圈禁区 + 向内缩进映射）便于操作。
+//
 //   由此移除了 RegisterRawInputDevices / GetRawInputData / CreateWindowExW /
 //   Get/SetWindowLongPtr 的全部 Hook，对目标程序零侵入，行为更标准、更稳健，
 //   并且天然修复了"启用后吞掉真实鼠标"的副作用。
@@ -41,7 +46,7 @@
 namespace fs = std::filesystem;
 
 // 版本号
-#define VERSION_STRING "2.0.0"
+#define VERSION_STRING "2.1.0"
 
 // HID 规范中未预定义的使用量
 #define HID_USAGE_DIGITIZER_CONTACT_ID   0x51
@@ -63,6 +68,13 @@ namespace fs = std::filesystem;
 #define HOTKEY_SAVE_ID         0xCAFC
 #define HOTKEY_SAVE_MOD        (MOD_SHIFT)
 #define HOTKEY_SAVE_VK         VK_F9
+
+// 手势识别参数（把触控板当触摸屏：落指=点击/拖动，长按=右键）
+#define EDGE_PADDING_PCT    0.20   // 可映射区域向内缩进比例（便于到达屏幕边缘）
+#define EDGE_DEADZONE_PCT   0.06   // 最外圈完全禁区比例（防误触）
+#define LONG_PRESS_MS       500    // 长按触发右键的时长(ms)
+#define DRAG_THRESHOLD_PCT  0.06   // 移动超过此比例视为拖动（取消长按右键）
+#define LONG_PRESS_TIMER_ID 1      // 长按检测定时器 ID
 
 // 校准配置文件（JSON）
 #define CALIBRATION_FILE "atcalibration.json"
@@ -171,6 +183,14 @@ static std::unordered_map<HANDLE, at_device_info> g_devices; // 每设备 HID �
 static std::mutex g_devicesMutex;         // 保护 g_devices（配置加载可能跨线程）
 static HWND g_hWnd = nullptr;             // 我们的 message-only 窗口
 static HANDLE g_hThread = nullptr;        // 工作线程句柄
+
+// 手势状态机：把触控板当触摸屏使用
+enum class AT_GestureState { Idle, Pressing, Dragging, Right };
+static AT_GestureState g_gesture = AT_GestureState::Idle;
+static POINT g_downScreen = { 0, 0 };     // 落点绝对坐标(0..65535)
+static POINT g_lastScreen = { 0, 0 };     // 最近一次绝对坐标
+static POINT g_downPhys = { 0, 0 };       // 落点物理坐标（拖动/长按判定用）
+static bool g_longPressArmed = false;     // 长按定时器是否处于激活
 
 // ----------------------------------------------------------------------------
 // Raw input / HID 辅助函数（这部分逻辑经实践验证正确，予以保留）
@@ -312,22 +332,46 @@ static void AT_RegisterHotKeys(HWND hWnd)
 }
 
 // 触控板物理坐标 -> 屏幕归一化坐标（0..65535，与 MOUSE_MOVE_ABSOLUTE 一致）
-static POINT AT_TouchpadToScreen(RECT touchpadRect, POINT touchpadPoint)
+// 边缘留圈（两者结合）：
+//   1) 最外圈 EDGE_DEADZONE_PCT 设为完全禁区（落指在此圈内直接忽略，防误触）；
+//   2) 有效区域再向内缩进 EDGE_PADDING_PCT 映射到全屏，便于到达屏幕边缘。
+// checkDeadzone=true 时（落指判定）执行禁区检查；手势进行中的跟手移动
+//   传 false，仅做 clamp（避免手指移到边缘时坐标丢失）。
+// 返回 true 表示坐标有效（已写入 outScreen），false 表示落在禁区。
+static bool AT_TouchpadToScreen(RECT touchpadRect, POINT p, POINT &outScreen, bool checkDeadzone)
 {
-    LONG tpX = max(touchpadRect.left, min(touchpadRect.right, touchpadPoint.x));
-    LONG tpY = max(touchpadRect.top, min(touchpadRect.bottom, touchpadPoint.y));
+    LONG width = touchpadRect.right + 1 - touchpadRect.left;
+    LONG height = touchpadRect.bottom + 1 - touchpadRect.top;
+    if (width <= 0 || height <= 0) return false;
 
-    LONG tpDeltaX = tpX - touchpadRect.left;
-    LONG tpDeltaY = tpY - touchpadRect.top;
+    if (checkDeadzone) {
+        LONG dzX = static_cast<LONG>(width * EDGE_DEADZONE_PCT);
+        LONG dzY = static_cast<LONG>(height * EDGE_DEADZONE_PCT);
+        if (p.x < touchpadRect.left + dzX || p.x > touchpadRect.right - dzX ||
+            p.y < touchpadRect.top + dzY  || p.y > touchpadRect.bottom - dzY) {
+            return false; // 落在最外圈禁区，忽略
+        }
+    }
 
-    // HID 规范中最大值是包含的，因此需要 +1
-    LONG tpWidth = touchpadRect.right + 1 - touchpadRect.left;
-    LONG tpHeight = touchpadRect.bottom + 1 - touchpadRect.top;
+    // 向内缩进映射区域（clamp 到 inner，确保边缘可达）
+    LONG padX = static_cast<LONG>(width * EDGE_PADDING_PCT);
+    LONG padY = static_cast<LONG>(height * EDGE_PADDING_PCT);
+    RECT inner{
+        touchpadRect.left + padX, touchpadRect.top + padY,
+        touchpadRect.right - padX, touchpadRect.bottom - padY
+    };
+    if (inner.right <= inner.left) inner.right = inner.left + 1;
+    if (inner.bottom <= inner.top) inner.bottom = inner.top + 1;
 
-    LONG scDeltaX = (tpDeltaX << 16) / tpWidth;
-    LONG scDeltaY = (tpDeltaY << 16) / tpHeight;
+    LONG cx = max(inner.left, min(inner.right, p.x));
+    LONG cy = max(inner.top, min(inner.bottom, p.y));
 
-    return POINT{ scDeltaX, scDeltaY };
+    LONG iw = inner.right + 1 - inner.left;
+    LONG ih = inner.bottom + 1 - inner.top;
+
+    outScreen.x = ((cx - inner.left) << 16) / iw;
+    outScreen.y = ((cy - inner.top) << 16) / ih;
+    return true;
 }
 
 // 获取（并缓存）设备的 HID 解析信息
@@ -565,7 +609,32 @@ static void AT_InjectAbsoluteMouse(LONG x, LONG y)
     }
 }
 
-// 处理一次触控板 WM_INPUT 事件：解析 -> 映射 -> 注入绝对鼠标
+// 在指定绝对坐标处注入鼠标按键事件（落指左键按下/弹起、长按右键等）
+static void AT_InjectButton(DWORD buttonFlags, LONG x, LONG y)
+{
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dx = x;          // 携带绝对坐标，确保按钮发生在落点/当前点
+    input.mi.dy = y;
+    input.mi.dwFlags = buttonFlags | MOUSEEVENTF_ABSOLUTE;
+    if (SendInput(1, &input, sizeof(INPUT)) != 1) {
+        at_log(L"SendInput(button) failed: %lu", GetLastError());
+    }
+}
+
+// 复位手势状态（并清理长按定时器）
+static void AT_ResetGesture()
+{
+    if (g_longPressArmed) {
+        KillTimer(g_hWnd, LONG_PRESS_TIMER_ID);
+        g_longPressArmed = false;
+    }
+    g_gesture = AT_GestureState::Idle;
+}
+
+// 处理一次触控板 WM_INPUT 事件：触屏式手势识别
+//   落指 -> 左键按下；跟手移动 -> 拖动；抬起 -> 弹起（轻触=单击，滑动=拖动）
+//   落指后持续按下且未明显滑动，超过 LONG_PRESS_MS -> 取消左键并弹出右键菜单
 static void AT_HandleRawInput(HRAWINPUT hInput)
 {
     RAWINPUTHEADER hdr = AT_GetRawInputHeader(hInput);
@@ -574,18 +643,58 @@ static void AT_HandleRawInput(HRAWINPUT hInput)
     at_device_info &dev = AT_GetDeviceInfo(hdr.hDevice);
     auto input = AT_GetRawInput(hInput, hdr);
     std::vector<at_contact> contacts = AT_GetContacts(dev, input.get());
-    if (contacts.empty()) return;
 
     if (g_inCalibrationMode) {
-        AT_ExtendCalibrationArea(hdr.hDevice, contacts);
+        if (!contacts.empty()) AT_ExtendCalibrationArea(hdr.hDevice, contacts);
+        return;
+    }
+
+    // 所有触点已抬起 -> 结束当前手势
+    if (contacts.empty()) {
+        if (g_gesture == AT_GestureState::Pressing ||
+            g_gesture == AT_GestureState::Dragging) {
+            AT_InjectButton(MOUSEEVENTF_LEFTUP, g_lastScreen.x, g_lastScreen.y);
+        }
+        AT_ResetGesture();
         return;
     }
 
     at_contact contact = AT_GetPrimaryContact(contacts);
     RECT touchArea = AT_GetTouchArea(contact);
-    POINT screenPoint = AT_TouchpadToScreen(touchArea, contact.point);
-    at_log(L"Injecting absolute input at (%d,%d)", screenPoint.x, screenPoint.y);
-    AT_InjectAbsoluteMouse(screenPoint.x, screenPoint.y);
+    POINT screen;
+
+    // 落指：若落在最外圈禁区则忽略整次手势
+    if (g_gesture == AT_GestureState::Idle) {
+        if (!AT_TouchpadToScreen(touchArea, contact.point, screen, true))
+            return;
+        g_gesture = AT_GestureState::Pressing;
+        g_downScreen = screen;
+        g_lastScreen = screen;
+        g_downPhys = contact.point;
+        AT_InjectButton(MOUSEEVENTF_LEFTDOWN, screen.x, screen.y);
+        g_longPressArmed = true;
+        SetTimer(g_hWnd, LONG_PRESS_TIMER_ID, LONG_PRESS_MS, nullptr);
+        return;
+    }
+
+    // 已在手势中：跟手移动（不判禁区，clamp 到屏幕边缘）
+    AT_TouchpadToScreen(touchArea, contact.point, screen, false);
+    g_lastScreen = screen;
+    AT_InjectAbsoluteMouse(screen.x, screen.y);
+
+    // 按下后发生明显滑动 -> 转为拖动，取消长按右键（手指微抖不触发）
+    if (g_gesture == AT_GestureState::Pressing) {
+        LONG w = touchArea.right + 1 - touchArea.left;
+        LONG h = touchArea.bottom + 1 - touchArea.top;
+        LONG dx = labs(contact.point.x - g_downPhys.x);
+        LONG dy = labs(contact.point.y - g_downPhys.y);
+        if (w > 0 && h > 0 &&
+            (dx > w * DRAG_THRESHOLD_PCT || dy > h * DRAG_THRESHOLD_PCT)) {
+            g_gesture = AT_GestureState::Dragging;
+            g_longPressArmed = false;
+            KillTimer(g_hWnd, LONG_PRESS_TIMER_ID);
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -614,6 +723,20 @@ static LRESULT CALLBACK AT_WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
             AT_LoadCalibration();
         } else if (wParam == HOTKEY_SAVE_ID) {
             AT_SaveCalibration();
+        }
+        break;
+    case WM_TIMER:
+        if (wParam == LONG_PRESS_TIMER_ID) {
+            KillTimer(g_hWnd, LONG_PRESS_TIMER_ID);
+            g_longPressArmed = false;
+            // 长按且未明显滑动 -> 取消左键，在落点弹出右键菜单
+            if (g_gesture == AT_GestureState::Pressing) {
+                AT_InjectButton(MOUSEEVENTF_LEFTUP, g_downScreen.x, g_downScreen.y);
+                AT_InjectButton(MOUSEEVENTF_RIGHTDOWN, g_downScreen.x, g_downScreen.y);
+                AT_InjectButton(MOUSEEVENTF_RIGHTUP, g_downScreen.x, g_downScreen.y);
+                g_gesture = AT_GestureState::Right;
+                at_log(L"Long-press -> right click at (%d,%d)", g_downScreen.x, g_downScreen.y);
+            }
         }
         break;
     case WM_DESTROY:
