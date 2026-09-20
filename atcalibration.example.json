@@ -1,0 +1,10 @@
+{
+  "screen_width": 1920,
+  "screen_height": 1080,
+  "calibration_points": [
+    {"x": 100, "y": 100, "touch_x": 98, "touch_y": 102},
+    {"x": 960, "y": 540, "touch_x": 961, "touch_y": 539},
+    {"x": 1820, "y": 980, "touch_x": 1819, "touch_y": 981}
+  ],
+  "timestamp": "2026-09-20T19:47:00+08:00"
+}
