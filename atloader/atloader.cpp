@@ -126,7 +126,15 @@ static void InjectAndLaunch(const std::wstring &targetPath, const std::wstring &
     }
 
     // 等待目标进程完成初始化（含 DLL 注入与窗口创建），确认注入生效
-    WaitForInputIdle(pi.hProcess, 10000);
+    DWORD waitResult = WaitForInputIdle(pi.hProcess, 10000);
+    if (waitResult == WAIT_FAILED) {
+        DWORD err = GetLastError();
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        throw win32_error(err);
+    } else if (waitResult == WAIT_TIMEOUT) {
+        std::wcerr << L"Warning: WaitForInputIdle timed out (10s), process may not be fully initialized\n";
+    }
 
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
