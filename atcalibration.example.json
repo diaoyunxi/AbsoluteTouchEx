@@ -1,0 +1,12 @@
+{
+  "screen_width": 1920,
+  "screen_height": 1080,
+  "touchpad_width": 1200,
+  "touchpad_height": 750,
+  "offset_x": 0,
+  "offset_y": 0,
+  "scale_x": 1.0,
+  "scale_y": 1.0,
+  "invert_x": false,
+  "invert_y": false
+}
