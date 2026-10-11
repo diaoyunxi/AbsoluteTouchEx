@@ -61,3 +61,12 @@
 #*.PDF   diff=astextplain
 #*.rtf   diff=astextplain
 #*.RTF   diff=astextplain
+
+###############################################################################
+# Binary library files
+###############################################################################
+*.lib   binary
+*.dll   binary
+*.exe   binary
+*.obj   binary
+*.pdb   binary
