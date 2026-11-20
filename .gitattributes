@@ -70,3 +70,5 @@
 *.exe   binary
 *.obj   binary
 *.pdb   binary
+
+* text=auto eol=lf
